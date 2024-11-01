@@ -11,6 +11,7 @@ DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 TOPIC_FORMAT = os.getenv('TOPIC_FORMAT')
 WARNING_AMPERAGE = float(os.getenv('WARNING_AMPERAGE'))
 CRITICAL_AMPERAGE = float(os.getenv('CRITICAL_AMPERAGE'))
+ALERT_DECREASE_DELAY = float(os.getenv('ALERT_DECREASE_DELAY', 30))
 
 NUMBER_EMOJIS = [':zero:', ':one:', ':two:', ':three:', ':four:', ':five:', ':six:', ':seven:', ':eight:', ':nine:', ':keycap_ten:']
 NUMBER_NAMES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten']
@@ -32,44 +33,57 @@ class AlertLevel(IntEnum):
 
 
 class PhaseDaemon:
-    def __init__(self, phase: int, warning_threshold: float, critical_threshold: float):
+    def __init__(self, phase: int, warning_threshold: float, critical_threshold: float, alert_decrease_delay: float):
         self.phase = phase
         self.warning_threshold = warning_threshold
         self.critical_threshold = critical_threshold
+        self.alert_decrease_delay = alert_decrease_delay
 
         self.topic = TOPIC_FORMAT.format(phase=phase)
 
         self.alert_level = AlertLevel.NOMINAL
         self.last_alert_repeat = datetime.now()
 
+        self.last_alert_increase = datetime.now()
+
     def subscribe(self, client):
         client.subscribe(self.topic)
 
     def on_reading(self, amperage: float):
-        new_alert_level = self.calculate_alert_level(amperage)
+        new_level = self.calculate_alert_level(amperage)
+        old_level = self.alert_level
 
-        if new_alert_level != self.alert_level:
-            # Alert level has changed
-            self.on_alert_level_change(self.alert_level, new_alert_level, amperage)
-            self.alert_level = new_alert_level
-
+        if new_level > old_level:
+            # Alert level increase
+            self.alert_level = new_level
             self.last_alert_repeat = datetime.now()
+            self.last_alert_increase = datetime.now()
+
+            send_discord_message(
+                f'Phase **{NUMBER_NAMES[self.phase].upper()}** increased :arrow_up: alert level to **{new_level.name}** {new_level.emoji} (`{amperage:.1f} A`)'
+                f'{" :warning:" if new_level == AlertLevel.CRITICAL else ""}'
+            )
+        elif new_level < old_level:
+            # Alert level decrease
+            time_since_last_increase = (datetime.now() - self.last_alert_increase).total_seconds()
+            if time_since_last_increase > self.alert_decrease_delay:
+                # Enough time has passed, process alert decrease
+                self.alert_level = new_level
+                self.last_alert_repeat = datetime.now()
+
+                send_discord_message(
+                    f'Phase **{NUMBER_NAMES[self.phase].upper()}** decreased :arrow_down: alert level to {new_level.name} {new_level.emoji} (`{amperage:.1f} A`)'
+                )
         else:
-            # Alert level has not changed
+            # Alert level stayed the same
             if self.alert_level.repeat_interval is not None:
                 time_since_last_alert = (datetime.now() - self.last_alert_repeat).total_seconds()
                 if time_since_last_alert > self.alert_level.repeat_interval:
-                    self.on_alert_repeat(new_alert_level, amperage)
                     self.last_alert_repeat = datetime.now()
 
-    def on_alert_level_change(self, old_level: AlertLevel, new_level: AlertLevel, amperage: float):
-        if new_level > old_level:
-            send_discord_message(f'Phase **{NUMBER_NAMES[self.phase].upper()}** increased :arrow_up: alert level to **{new_level.name}** {new_level.emoji} (`{amperage:.1f} A`) {":warning:" if new_level == AlertLevel.CRITICAL else ""}')
-        else:
-            send_discord_message(f'Phase **{NUMBER_NAMES[self.phase].upper()}** decreased :arrow_down: alert level to {new_level.name} {new_level.emoji} (`{amperage:.1f} A`)')
-
-    def on_alert_repeat(self, alert_level: AlertLevel, amperage: float):
-        send_discord_message(f'Phase **{NUMBER_NAMES[self.phase].upper()}** alert level is still **{alert_level.name}** {alert_level.emoji} (`{amperage:.1f} A`)')
+                    send_discord_message(
+                        f'Phase **{NUMBER_NAMES[self.phase].upper()}** alert level is still **{new_level.name}** {new_level.emoji} (`{amperage:.1f} A`)'
+                    )
 
     def calculate_alert_level(self, amperage: float):
         if amperage > self.critical_threshold:
@@ -81,7 +95,7 @@ class PhaseDaemon:
 
 
 phases = [
-    PhaseDaemon(phase + 1, WARNING_AMPERAGE, CRITICAL_AMPERAGE)
+    PhaseDaemon(phase + 1, WARNING_AMPERAGE, CRITICAL_AMPERAGE, ALERT_DECREASE_DELAY)
     for phase in range(3)
 ]
 
